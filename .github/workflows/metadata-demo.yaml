@@ -1,0 +1,31 @@
+name: metadata demo
+
+on:
+  workflow_dispatch:
+
+jobs:
+  generate-summaries:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+
+    - name: Install llamero
+      run: touch requirements.txt
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        #cache: 'pip'
+
+    - name: Install llamero
+      run: pip install llamero
+
+    - name: Generate summaries
+      run: |
+        python scripts/demo_platform_metadata.py
