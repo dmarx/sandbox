@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-# demo_platform_metadata.py - Demo script for research platform metadata extraction
-
-import json
-from loguru import logger
-import fire
-#!/usr/bin/env python3
-# research_platform_metadata.py - Extract metadata from Wikidata for research platforms
+# improved_platform_metadata.py - Improved approach to extract metadata from Wikidata
 
 import re
 import requests
@@ -13,6 +7,7 @@ from urllib.parse import urlparse
 import sys
 from loguru import logger
 import fire
+import time
 
 
 def setup_logging():
@@ -31,38 +26,27 @@ def get_domain_from_url(url):
     return parsed_url.netloc
 
 
-def query_wikidata_for_platform(domain):
+def find_platform_in_wikidata(domain):
     """
-    Query Wikidata for information about a research platform based on its domain.
+    Find platform items in Wikidata based on domain.
+    Uses a simpler, more targeted SPARQL query.
     
     Args:
         domain: Domain name of the research platform (e.g., openreview.net)
         
     Returns:
-        Dictionary with platform metadata or None if not found
+        List of platform items (dicts) or None if not found
     """
-    # SPARQL query to find items with the given domain
+    # Simpler SPARQL query focused just on finding platform items
     sparql_query = f"""
-    SELECT ?item ?itemLabel ?itemDescription ?website ?identifierProperty ?identifierPropertyLabel
-           ?formatterURL ?urlPattern ?formatConstraint
+    SELECT ?item ?itemLabel ?itemDescription ?website
     WHERE {{
       ?item wdt:P856 ?website .  # P856 is the "official website" property
       FILTER(CONTAINS(STR(?website), "{domain}")) .
       
-      # Optional: Find identifier properties associated with this item
-      OPTIONAL {{
-        ?identifierProperty wdt:P1629 ?item .  # P1629 is "item of property"
-        OPTIONAL {{ ?identifierProperty wdt:P1630 ?formatterURL }} .  # P1630 is formatter URL
-        OPTIONAL {{ ?identifierProperty wdt:P8966 ?urlPattern }} .    # P8966 is URL match pattern
-        OPTIONAL {{
-          ?identifierProperty p:P2302 ?constraint .  # P2302 is property constraint
-          ?constraint ps:P2302 wd:Q21502404 .        # Q21502404 is format constraint
-          ?constraint pq:P1793 ?formatConstraint .   # P1793 is format as regex
-        }}
-      }}
-      
       SERVICE wikibase:label {{ bd:serviceParam wikibase:language "[AUTO_LANGUAGE],en". }}
     }}
+    LIMIT 10
     """
     
     # Execute SPARQL query against Wikidata
@@ -73,53 +57,72 @@ def query_wikidata_for_platform(domain):
         data = response.json()
         
         if not data.get("results", {}).get("bindings"):
-            logger.warning(f"No Wikidata entry found for domain: {domain}")
+            logger.warning(f"No Wikidata items found for domain: {domain}")
             return None
             
         # Process and return the results
         results = data["results"]["bindings"]
-        platform_data = {
-            "domain": domain,
-            "wikidata_items": [],
-            "identifier_properties": []
-        }
-        
-        # Track processed items to avoid duplicates
-        processed_items = set()
-        processed_properties = set()
+        platform_items = []
         
         for result in results:
-            # Process platform item
-            if "item" in result and result["item"]["value"] not in processed_items:
+            if "item" in result:
                 item_id = result["item"]["value"].split("/")[-1]
-                processed_items.add(result["item"]["value"])
-                
                 platform_item = {
                     "id": item_id,
                     "label": result.get("itemLabel", {}).get("value", "Unknown"),
                     "description": result.get("itemDescription", {}).get("value", ""),
                     "website": result.get("website", {}).get("value", "")
                 }
-                platform_data["wikidata_items"].append(platform_item)
-            
-            # Process identifier properties
-            if "identifierProperty" in result and result["identifierProperty"]["value"] not in processed_properties:
-                prop_id = result["identifierProperty"]["value"].split("/")[-1]
-                processed_properties.add(result["identifierProperty"]["value"])
-                
-                prop_data = {
-                    "id": prop_id,
-                    "label": result.get("identifierPropertyLabel", {}).get("value", "Unknown"),
-                    "formatter_url": result.get("formatterURL", {}).get("value", ""),
-                    "url_pattern": result.get("urlPattern", {}).get("value", ""),
-                    "format_constraint": result.get("formatConstraint", {}).get("value", "")
-                }
-                platform_data["identifier_properties"].append(prop_data)
+                platform_items.append(platform_item)
         
-        return platform_data
+        return platform_items
         
     except requests.RequestException as e:
-        logger.error(f"Error querying Wikidata: {e}")
+        logger.error(f"Error querying Wikidata SPARQL endpoint: {e}")
+        return None
+
+
+def find_identifier_properties(item_id):
+    """
+    Find identifier properties associated with a Wikidata item.
+    Uses direct API calls rather than complex SPARQL queries.
+    
+    Args:
+        item_id: Wikidata item ID (e.g., Q56476926)
+        
+    Returns:
+        List of property IDs or None if none found
+    """
+    # Use Wikidata API to find properties that have this item as their "item of property"
+    api_url = "https://www.wikidata.org/w/api.php"
+    params = {
+        "action": "query",
+        "format": "json",
+        "list": "backlinks",
+        "bltitle": f"Item:{item_id}",
+        "blnamespace": 120,  # Property namespace
+        "bllimit": 50
+    }
+    
+    try:
+        logger.info(f"Finding identifier properties for item {item_id}")
+        response = requests.get(api_url, params=params)
+        response.raise_for_status()
+        data = response.json()
+        
+        properties = []
+        for backlink in data.get("query", {}).get("backlinks", []):
+            # Extract property ID from title (format: "Property:PXXXX")
+            prop_id = backlink["title"].split(":")[-1]
+            properties.append(prop_id)
+        
+        if not properties:
+            logger.warning(f"No properties found linking to item {item_id}")
+            
+        return properties
+    
+    except requests.RequestException as e:
+        logger.error(f"Error querying Wikidata API for properties: {e}")
         return None
 
 
@@ -195,43 +198,166 @@ def get_property_details(property_id):
         if "P1629" in claims:
             property_data["applicable_item"] = claims["P1629"][0]["mainsnak"]["datavalue"]["value"]["id"]
         
+        # Get human-readable label
+        property_data["label"] = property_data["labels"].get("en", property_id)
+        
+        logger.info(f"Found property details for {property_id}: {property_data['label']}")
         return property_data
         
     except requests.RequestException as e:
-        logger.error(f"Error querying Wikidata API: {e}")
+        logger.error(f"Error querying Wikidata API for property details: {e}")
         return None
 
 
-def extract_id_from_url(url, id_patterns):
+def extract_id_from_url(url, property_details):
     """
-    Extract an identifier from a URL using patterns from Wikidata.
+    Extract an identifier from a URL using patterns from a property.
     
     Args:
         url: URL to extract from
-        id_patterns: List of dictionaries with regex patterns and property IDs
+        property_details: Dictionary with property details including url_pattern
         
     Returns:
-        Dictionary with extracted IDs and their property IDs
+        Extracted ID or None if not found
     """
-    extracted_ids = {}
+    if not property_details.get("url_pattern"):
+        return None
+            
+    try:
+        pattern = property_details["url_pattern"]
+        # If pattern uses Wikidata's capture group syntax, extract the ID
+        match = re.search(pattern, url)
+        if match and match.groups():
+            return match.group(1)
+    except re.error:
+        logger.warning(f"Invalid regex pattern: {pattern}")
     
-    for pattern_info in id_patterns:
-        if not pattern_info.get("url_pattern"):
+    return None
+
+
+def validate_id_format(id_value, format_constraint):
+    """
+    Validate an ID against a format constraint.
+    
+    Args:
+        id_value: ID value to validate
+        format_constraint: Regex pattern for validation
+        
+    Returns:
+        True if valid, False otherwise
+    """
+    if not format_constraint:
+        return True
+        
+    try:
+        pattern = f"^{format_constraint}$"
+        return bool(re.match(pattern, id_value))
+    except re.error:
+        logger.warning(f"Invalid format constraint pattern: {format_constraint}")
+        return False
+
+
+def get_platform_metadata_via_search(domain):
+    """
+    Search for a platform in Wikidata based on its domain.
+    
+    Args:
+        domain: Domain name (e.g., openreview.net)
+        
+    Returns:
+        Dictionary with platform metadata or None if not found
+    """
+    # Step 1: Find platform items in Wikidata
+    platform_items = find_platform_in_wikidata(domain)
+    if not platform_items:
+        logger.warning(f"Could not find platform items for domain: {domain}")
+        return None
+    
+    # Step 2: Initialize platform metadata
+    platform_data = {
+        "domain": domain,
+        "wikidata_items": platform_items,
+        "identifier_properties": []
+    }
+    
+    # Step 3: Find identifier properties for each platform item
+    for item in platform_items:
+        item_id = item["id"]
+        property_ids = find_identifier_properties(item_id)
+        
+        if not property_ids:
             continue
             
-        try:
-            pattern = pattern_info["url_pattern"]
-            # If pattern uses Wikidata's capture group syntax, extract the ID
-            match = re.search(pattern, url)
-            if match and match.groups():
-                extracted_ids[pattern_info["id"]] = {
-                    "id": match.group(1),
-                    "property": pattern_info
-                }
-        except re.error:
-            logger.warning(f"Invalid regex pattern: {pattern}")
+        # Step 4: Get details for each property
+        for prop_id in property_ids:
+            # Add delay to avoid overwhelming the API
+            time.sleep(0.5)
+            
+            prop_details = get_property_details(prop_id)
+            if not prop_details:
+                continue
+                
+            # Only include identifier properties with formatter URL or URL pattern
+            if prop_details.get("formatter_url") or prop_details.get("url_pattern"):
+                # Check if this property applies to the platform item we found
+                applies_to_item = False
+                if prop_details.get("applicable_item") == item_id:
+                    applies_to_item = True
+                
+                # If not explicitly linked, check datatype to filter to external IDs
+                if not applies_to_item and prop_details.get("datatype") == "external-id":
+                    applies_to_item = True
+                
+                if applies_to_item:
+                    # Convert to simplified format for our use
+                    simplified_prop = {
+                        "id": prop_details["id"],
+                        "label": prop_details["label"],
+                        "formatter_url": prop_details.get("formatter_url", ""),
+                        "url_pattern": prop_details.get("url_pattern", ""),
+                        "format_constraint": prop_details.get("format_constraint", "")
+                    }
+                    
+                    # Check if we already have this property
+                    existing_ids = [p["id"] for p in platform_data["identifier_properties"]]
+                    if prop_details["id"] not in existing_ids:
+                        platform_data["identifier_properties"].append(simplified_prop)
     
-    return extracted_ids
+    return platform_data
+
+
+def get_property_by_id(property_id):
+    """
+    Get property details directly by ID, for use with known platforms.
+    
+    Args:
+        property_id: Wikidata property ID (e.g., P356 for DOI)
+        
+    Returns:
+        Dictionary with property details or None
+    """
+    prop_details = get_property_details(property_id)
+    if not prop_details:
+        return None
+        
+    return {
+        "id": prop_details["id"],
+        "label": prop_details["label"],
+        "formatter_url": prop_details.get("formatter_url", ""),
+        "url_pattern": prop_details.get("url_pattern", ""),
+        "format_constraint": prop_details.get("format_constraint", "")
+    }
+
+
+# Known property IDs for common platforms
+KNOWN_PLATFORMS = {
+    "openreview.net": ["P8968", "P8964", "P8965"],
+    "arxiv.org": ["P818"],
+    "doi.org": ["P356"],
+    "orcid.org": ["P496"],
+    "semanticscholar.org": ["P4028"],
+    "pubmed.ncbi.nlm.nih.gov": ["P698"]
+}
 
 
 def analyze_research_platform(url, property_id=None):
@@ -250,43 +376,87 @@ def analyze_research_platform(url, property_id=None):
     domain = get_domain_from_url(url)
     logger.info(f"Analyzing research platform at domain: {domain}")
     
-    # Get platform metadata from Wikidata
-    platform_data = query_wikidata_for_platform(domain)
+    # Initialize platform data
+    platform_data = {
+        "domain": domain,
+        "wikidata_items": [],
+        "identifier_properties": []
+    }
     
-    if not platform_data:
-        logger.warning(f"No metadata found for {domain} in Wikidata")
-        return None
-    
-    # If a specific property ID was provided, get its details
-    if property_id:
-        prop_details = get_property_details(property_id)
-        if prop_details:
-            logger.info(f"Found property details for {property_id}: {prop_details['labels'].get('en', '')}")
-            # Add to platform data if not already there
-            existing_ids = [p["id"] for p in platform_data["identifier_properties"]]
-            if property_id not in existing_ids:
+    # First approach: Use known platform data if available
+    if domain in KNOWN_PLATFORMS:
+        logger.info(f"Using known property IDs for {domain}")
+        platform_found = False
+        
+        for prop_id in KNOWN_PLATFORMS[domain]:
+            prop_details = get_property_by_id(prop_id)
+            if prop_details:
+                if not platform_found:
+                    # If we have at least one property, try to get its applicable item
+                    if prop_details.get("applicable_item"):
+                        item_id = prop_details["applicable_item"]
+                        # Get item details (simplified for this example)
+                        platform_data["wikidata_items"].append({
+                            "id": item_id,
+                            "label": f"Item {item_id}",
+                            "description": "",
+                            "website": f"https://{domain}"
+                        })
+                        platform_found = True
+                
                 platform_data["identifier_properties"].append(prop_details)
     
+    # Second approach: Search for platform in Wikidata
+    if not platform_data["identifier_properties"]:
+        logger.info(f"Searching Wikidata for platform: {domain}")
+        search_result = get_platform_metadata_via_search(domain)
+        if search_result:
+            platform_data = search_result
+    
+    # If a specific property ID was provided, get its details
+    if property_id and property_id not in [p["id"] for p in platform_data["identifier_properties"]]:
+        prop_details = get_property_by_id(property_id)
+        if prop_details:
+            platform_data["identifier_properties"].append(prop_details)
+    
     # Extract identifiers from URL
-    id_patterns = [
-        {
-            "id": prop["id"],
-            "url_pattern": prop["url_pattern"],
-            "formatter_url": prop["formatter_url"]
-        }
-        for prop in platform_data["identifier_properties"]
-        if prop["url_pattern"]
-    ]
-    
-    extracted_ids = extract_id_from_url(url, id_patterns)
-    platform_data["extracted_ids"] = extracted_ids
-    
-    # Generate formatter URLs for extracted IDs
+    platform_data["extracted_ids"] = {}
     platform_data["formatted_urls"] = {}
-    for prop_id, id_info in extracted_ids.items():
-        if id_info["property"]["formatter_url"]:
-            formatted_url = id_info["property"]["formatter_url"].replace("$1", id_info["id"])
-            platform_data["formatted_urls"][prop_id] = formatted_url
+    
+    for prop in platform_data["identifier_properties"]:
+        extracted_id = extract_id_from_url(url, prop)
+        if extracted_id:
+            # Validate against format constraint if available
+            is_valid = validate_id_format(extracted_id, prop.get("format_constraint"))
+            if is_valid:
+                platform_data["extracted_ids"][prop["id"]] = {
+                    "id": extracted_id,
+                    "property": prop
+                }
+                
+                # Generate formatted URL if formatter is available
+                if prop.get("formatter_url"):
+                    formatted_url = prop["formatter_url"].replace("$1", extracted_id)
+                    platform_data["formatted_urls"][prop["id"]] = formatted_url
+    
+    # If no identifiers were extracted but we have properties with URL patterns,
+    # try a different approach: look for common ID patterns in the URL
+    if not platform_data["extracted_ids"]:
+        for prop in platform_data["identifier_properties"]:
+            if prop.get("url_pattern"):
+                # Try a more general pattern based on the domain and common ID formats
+                if domain == "doi.org":
+                    # DOIs often follow pattern: 10.XXXX/YYYY
+                    doi_match = re.search(r'(10\.\d+/[^/\s]+)$', url)
+                    if doi_match:
+                        extracted_id = doi_match.group(1)
+                        platform_data["extracted_ids"][prop["id"]] = {
+                            "id": extracted_id,
+                            "property": prop
+                        }
+                        if prop.get("formatter_url"):
+                            formatted_url = prop["formatter_url"].replace("$1", extracted_id)
+                            platform_data["formatted_urls"][prop["id"]] = formatted_url
     
     return platform_data
 
@@ -332,9 +502,13 @@ def main(url, property_id=None):
     
     return result
 
+#!/usr/bin/env python3
+# improved_demo.py - Improved demo for research platform metadata extraction
 
-# if __name__ == "__main__":
-#     fire.Fire(main)
+import json
+from loguru import logger
+import fire
+#from improved_platform_metadata import analyze_research_platform
 
 
 def demonstrate_openreview():
@@ -359,13 +533,12 @@ def demonstrate_openreview():
         logger.info(f"Extracted OpenReview ID: {id_value}")
         
         # Demonstrate validation against format constraint
-        if result["identifier_properties"]:
-            for prop in result["identifier_properties"]:
-                if prop["id"] == property_id and prop["format_constraint"]:
-                    import re
-                    pattern = prop["format_constraint"]
-                    is_valid = bool(re.match(f"^{pattern}$", id_value))
-                    logger.info(f"ID validation against format constraint: {is_valid}")
+        for prop in result["identifier_properties"]:
+            if prop["id"] == property_id and prop["format_constraint"]:
+                import re
+                pattern = prop["format_constraint"]
+                is_valid = bool(re.match(f"^{pattern}$", id_value))
+                logger.info(f"ID validation against format constraint: {is_valid}")
     
     return result
 
@@ -392,6 +565,10 @@ def demonstrate_arxiv():
         api_url = f"http://export.arxiv.org/api/query?id_list={arxiv_id}"
         logger.info(f"API URL: {api_url}")
     
+    # Print complete metadata
+    logger.info("\nComplete metadata (JSON):")
+    print(json.dumps(result, indent=2))
+    
     return result
 
 
@@ -417,6 +594,39 @@ def demonstrate_doi():
         api_url = f"https://api.crossref.org/works/{doi}"
         logger.info(f"API URL: {api_url}")
     
+    # Print complete metadata
+    logger.info("\nComplete metadata (JSON):")
+    print(json.dumps(result, indent=2))
+    
+    return result
+
+
+def demonstrate_orcid():
+    """Demonstrate metadata extraction for ORCID."""
+    # Sample URL from ORCID
+    url = "https://orcid.org/0000-0002-1825-0097"
+    property_id = "P496"  # ORCID ID
+    
+    logger.info("\n" + "=" * 80)
+    logger.info("DEMONSTRATING ORCID METADATA EXTRACTION")
+    logger.info("=" * 80)
+    
+    result = analyze_research_platform(url, property_id)
+    
+    # Show how to use the extracted ORCID ID
+    if result and result["extracted_ids"] and property_id in result["extracted_ids"]:
+        orcid_id = result["extracted_ids"][property_id]["id"]
+        logger.info(f"\nExtracted ORCID ID: {orcid_id}")
+        
+        # Show how to use this with ORCID API
+        logger.info("\nExample of using this ID with ORCID API:")
+        api_url = f"https://pub.orcid.org/v3.0/{orcid_id}"
+        logger.info(f"API URL: {api_url}")
+    
+    # Print complete metadata
+    logger.info("\nComplete metadata (JSON):")
+    print(json.dumps(result, indent=2))
+    
     return result
 
 
@@ -435,6 +645,11 @@ def demonstrate_custom():
         property_id = 'P' + property_id if property_id.isdigit() else None
     
     result = analyze_research_platform(url, property_id)
+    
+    # Print complete metadata
+    logger.info("\nComplete metadata (JSON):")
+    print(json.dumps(result, indent=2))
+    
     return result
 
 
@@ -443,7 +658,7 @@ def main(mode="all", url=None, property_id=None):
     Run demonstration of research platform metadata extraction.
     
     Args:
-        mode: One of "all", "openreview", "arxiv", "doi", "custom", or "url"
+        mode: One of "all", "openreview", "arxiv", "doi", "orcid", "custom", or "url"
         url: URL to analyze if mode is "url"
         property_id: Optional Wikidata property ID to use for extraction
     """
@@ -451,19 +666,23 @@ def main(mode="all", url=None, property_id=None):
         demonstrate_openreview()
         demonstrate_arxiv()
         demonstrate_doi()
+        demonstrate_orcid()
     elif mode == "openreview":
         demonstrate_openreview()
     elif mode == "arxiv":
         demonstrate_arxiv()
     elif mode == "doi":
         demonstrate_doi()
+    elif mode == "orcid":
+        demonstrate_orcid()
     elif mode == "custom":
         demonstrate_custom()
     elif mode == "url" and url:
-        analyze_research_platform(url, property_id)
+        result = analyze_research_platform(url, property_id)
+        print(json.dumps(result, indent=2))
     else:
         logger.error(f"Invalid mode: {mode}")
-        logger.info("Available modes: all, openreview, arxiv, doi, custom, url")
+        logger.info("Available modes: all, openreview, arxiv, doi, orcid, custom, url")
 
 
 if __name__ == "__main__":
