@@ -24,7 +24,7 @@ jobs:
         #cache: 'pip'
 
     - name: Install llamero
-      run: pip install llamero
+      run: pip install llamero requests
 
     - name: Generate summaries
       run: |
